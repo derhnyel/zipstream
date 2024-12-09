@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 
+.vscode
+*.zip
+examples/zipstream
+
 # C extensions
 *.so
 
@@ -22,6 +26,7 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+.auto_venv
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -34,6 +39,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+.pytest_cache
 htmlcov/
 .tox/
 .coverage
@@ -42,10 +48,6 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *,cover
-
-# Translations
-*.mo
-*.pot
 
 # Django stuff:
 *.log

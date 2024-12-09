@@ -1,99 +1,105 @@
-#!/usr/bin/env python
-#coding: utf-8
-from __future__ import unicode_literals, absolute_import
-from collections import namedtuple
-#import zipfile
-import os, zlib
-import struct, time
+#
+# ZIP File streaming
+# based on official ZIP File Format Specification version 6.3.4
+# https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+#
+import os
+import time
+import zlib
+
+from . import consts
+
+__all__ = ("ZipStream", )
 
 
-__all__ = ("ZipStream",)
+class Processor:
+    def __init__(self, file_struct):
+        self.crc = 0
+        self.o_size = self.c_size = 0
+        if file_struct['cmethod'] is None:
+            self.process = self._process_through
+            self.tail = self._no_tail
+        elif file_struct['cmethod'] == 'deflate':
+            self.compr = zlib.compressobj(5, zlib.DEFLATED, -15)
+            self.process = self._process_deflate
+            self.tail = self._tail_deflate
 
-# zip constants
-ZIP32_VERSION = 20
-ZIP64_VERSION = 45
-ZIP32_LIMIT = (1 << 31) - 1
-UTF8_FLAG = 0x800   # utf-8 filename encoding flag
+    # no compression
+    def _process_through(self, chunk):
+        self.o_size += len(chunk)
+        self.c_size = self.o_size
+        self.crc = zlib.crc32(chunk, self.crc)
+        return chunk
 
-# file header
-LF_STRUCT = struct.Struct(b"<4sHHHHHLLLHH")
-LF_TUPLE = namedtuple("fileheader",
-    ("signature", "version", "flags",
-     "compression", "mod_time", "mod_date",
-     "crc", "comp_size", "uncomp_size",
-     "fname_len", "extra_len"))
-LF_MAGIC = b'\x50\x4b\x03\x04'
+    def _no_tail(self):
+        return b''
 
-# extra fields
-EXTRA_STRUCT = struct.Struct(b"<HH")
-EXTRA_TUPLE = namedtuple("extra", ("signature", "size"))
-EXTRA_64_STRUCT = struct.Struct(b"<HH")
-EXTRA_64_TUPLE = namedtuple("extra64local", ("uncomp_size", "comp_size") )
-CD_EXTRA_64_STRUCT = struct.Struct(b"<HHH")
-CD_EXTRA_64_TUPLE = namedtuple("extra64cdir", ("uncomp_size", "comp_size", "offset") )
+    # deflate compression
+    def _process_deflate(self, chunk):
+        self.o_size += len(chunk)
+        self.crc = zlib.crc32(chunk, self.crc)
+        chunk = self.compr.compress(chunk)
+        self.c_size += len(chunk)
+        return chunk
 
-# file descriptor
-DD_STRUCT = struct.Struct(b"<LLL")
-DD_STRUCT64 = struct.Struct(b"<LQQ")
-DD_TUPLE = namedtuple("filecrc",
-    ("crc", "comp_size", "uncomp_size") )
-DD_MAGIC = b'\x08\x07\x4b\x50'
+    def _tail_deflate(self):
+        chunk = self.compr.flush(zlib.Z_FINISH)
+        self.c_size += len(chunk)
+        return chunk
 
-
-# central directory file header
-CDLF_STRUCT = struct.Struct(b"<4sBBHHHHHLLLHHHHHLL")
-CDLF_TUPLE = namedtuple("cdfileheader",
-    ("signature", "system", "version", "version_ndd","flags",
-     "compression", "mod_time", "mod_date", "crc",
-     "comp_size", "uncomp_size", "fname_len", "extra_len",
-     "fcomm_len", "disk_start", "attrs_int", "attrs_ext", "offset"))
-CDFH_MAGIC = b'\x50\x4b\x01\x02'
-
-# end of central directory record
-CD_END_STRUCT = struct.Struct(b"<4sHHHHLLH")
-CD_END_TUPLE = namedtuple("cdend",
-    ("signature", "disk_num", "disk_cdstart", "disk_entries",
-     "total_entries", "cd_size", "cd_offset", "comment_len"))
-CD_END_MAGIC = b'\x50\x4b\x05\x06'
+    # after processing counters and crc
+    def state(self):
+        return self.crc, self.o_size, self.c_size
 
 # zip64 end of central directory record
-CD_END_STRUCT64 = struct.Struct(b"<4sQHHIIQQQQ")
-CD_END_TUPLE64 = namedtuple("cdend64",
-    ("signature", "zip64_eocd_size", "version", "version_ndd",
-        "disk_num", "disk_cdstart", "disk_entries", "total_entries",
-        "cd_size", "cd_offset"))
-CD_END_MAGIC64 = b'\x06\x06\x4b\x50'
+# CD_END_STRUCT64 = struct.Struct(b"<4sQHHIIQQQQ")
+# CD_END_TUPLE64 = namedtuple("cdend64",
+#     ("signature", "zip64_eocd_size", "version", "version_ndd",
+#         "disk_num", "disk_cdstart", "disk_entries", "total_entries",
+#         "cd_size", "cd_offset"))
+# CD_END_MAGIC64 = b'\x06\x06\x4b\x50'
 
-# zip64 end of central directory locator
-CD_LOC64_STRUCT = struct.Struct(b"<4sLQL")
-CD_LOC64_TUPLE =  namedtuple("cdfileheader64",
-    ("signature", "disk_cdstart", "offset", "disk_count"))
-CD_LOC64_MAGIC = b'\x07\x06\x4b\x50'
+# # zip64 end of central directory locator
+# CD_LOC64_STRUCT = struct.Struct(b"<4sLQL")
+# CD_LOC64_TUPLE =  namedtuple("cdfileheader64",
+#     ("signature", "disk_cdstart", "offset", "disk_count"))
+# CD_LOC64_MAGIC = b'\x07\x06\x4b\x50'
 
 
+class ZipBase:
 
-class ZipStream(object):
-
-    def __init__(self, zip64=False, chunksize=1024):
+    def __init__(self, files=[], chunksize=1024, zip64=False):
         """
-        zip64
-           False - 32bit
-           True - 64bit
-           None - auto (regardless of files size)
+        files - list of files, or generator returning files
+                each file entry should be represented as dict with
+                parameters:
+                file - full path to file name
+                name - (optional) name of file in zip archive
+                       if not used, filename stripped from 'file' will be used
+                stream - (optional) can be used as replacement for 'file'
+                         entry, will be treated as generator returnig
+                         chunks of data that will be streamed in archive.
+                         If used, then 'name' entry is required.
+                compression - (optional) compression method used for file
+                                can be None or 'deflate'
+        chunksize - default size of data block streamed from files
+        zip64 - turn on zip64 mode for archive
         """
+        self._source_of_files = files
         self.__files = []
         self.__zip64headers = False
-        self.__version = ZIP32_VERSION
+        self.__version = consts.ZIP32_VERSION
         if zip64==True:
             self.zip64 = None
             self.zip64_required()
         else:
             self.zip64 = zip64
         self.chunksize = chunksize
+        # this flag tuns on signature for data descriptor record.
+        # see section 4.3.9.3 of ZIP File Format Specification
         self.__use_ddmagic = True
         # central directory size and placement
-        self.__cdir_size = 0
-        self.__offset = 0
+        self.__cdir_size = self.__offset = 0
 
     def zip64_required(self):
         """
@@ -102,49 +108,71 @@ class ZipStream(object):
         if self.zip64:
             return
         if self.zip64==False:
-            raise Exception("Zip 64 mode is required to stream files larger than %i bytes" % ZIP32_LIMIT)
+            raise Exception("Zip 64 mode is required to stream files larger than %i bytes" % consts.ZIP32_LIMIT)
         self.zip64 = True
         self.__zip64headers = True
-        self.__version = ZIP64_VERSION
+        self.__version = consts.ZIP64_VERSION
 
-    def add_file(self, fname, newname=None):
+    def _create_file_struct(self, data):
+        """
+        extract info about streamed file and return all processed data
+        required in zip archive
+        """
         # date and time of file
         dt = time.localtime()
-        dosdate = (dt.tm_year-1980) << 9 | dt.tm_mon << 5 | dt.tm_mday
-        dostime = dt.tm_hour << 11 | dt.tm_min << 5 | (dt.tm_min // 2)
-        # check zip32 limit
-        stats = os.stat(fname)
-        if stats.st_size>ZIP32_LIMIT:
-            self.zip64_required()
-        # file properties
-        rec = { 'src' : fname,
-                'size': stats.st_size,
-                'mod_time': dosdate,
-                'mod_date': dostime,
-                'crc' : 0, # will be calculated during data streaming
-                "offset" : 0, # file header offset in zip file
-                'flags' : 0b00001000, # flag about using data descriptor is always on
-              }
-        # file name in archive
-        if newname:
-            fname = newname
-        else:
-            fname = os.path.split(fname)[1]
-        try:
-            rec['fname'] = fname.encode("ascii")
-        except UnicodeError:
-            rec['fname'] = fname.encode("utf-8")
-            rec['flags'] |= UTF8_FLAG
-        self.__files.append(rec)
+        dosdate = ((dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]) \
+            & 0xffff
+        dostime = (dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)) \
+            & 0xffff
 
-    def make_extra_field(self, signature, data):
+        # check zip32 limit
+        # stats = os.stat(data['file'])
+        #  if stats.st_size > consts.ZIP32_LIMIT:
+        #     self.zip64_required()
+        # file properties used in zip
+        file_struct = {'mod_time': dostime,
+                       'mod_date': dosdate,
+                       'crc': 0,  # will be calculated during data streaming
+                       "offset": 0,  # file header offset in zip file
+                       'flags': 0b00001000}  # flag about using data descriptor is always on
+
+        if 'file' in data:
+            file_struct['src'] = data['file']
+            file_struct['stype'] = 'f'
+        elif 'stream' in data:
+            file_struct['src'] = data['stream']
+            file_struct['stype'] = 's'
+        else:
+            raise Exception('No file or stream in sources')
+
+        cmpr = data.get('compression', None)
+        if cmpr not in (None, 'deflate'):
+            raise Exception('Unknown compression method %r' % cmpr)
+        file_struct['cmethod'] = cmpr
+        file_struct['cmpr_id'] = {
+            None: consts.COMPRESSION_STORE,
+            'deflate': consts.COMPRESSION_DEFLATE}[cmpr]
+
+        # file name in archive
+        if 'name' not in data:
+            data['name'] = os.path.basename(data['file'])
+        try:
+            file_struct['fname'] = data['name'].encode("ascii")
+        except UnicodeError:
+            file_struct['fname'] = data['name'].encode("utf-8")
+            file_struct['flags'] |= consts.UTF8_FLAG
+        return file_struct
+
+    # zip structures creation
+
+    def _make_extra_field(self, signature, data):
         """
         Extra field for file
         """
-        fields = { "signature" : signature,
-                   "size" : len(data) }
-        head = EXTRA_TUPLE( **fields )
-        head = EXTRA_STRUCT.pack( *head )
+        fields = {"signature": signature,
+                  "size": len(data)}
+        head = consts.EXTRA_TUPLE(**fields)
+        head = consts.EXTRA_STRUCT.pack(*head)
         return head + data
 
     def make_zip64_cdir_extra(self, fsize, compsize, offset):
@@ -154,9 +182,9 @@ class ZipStream(object):
         fields = {"comp_size" : compsize,
                   "uncomp_size" : fsize,
                   "offset" : offset }
-        data = CD_EXTRA_64_TUPLE( **fields )
-        data = CD_EXTRA_64_STRUCT.pack( *data )
-        return self.make_extra_field(0x0001, data)
+        data = consts.CD_EXTRA_64_TUPLE( **fields )
+        data = consts.CD_EXTRA_64_STRUCT.pack( *data )
+        return self._make_extra_field(0x0001, data)
 
     def make_zip64_local_extra(self, fsize, compsize):
         """
@@ -164,27 +192,26 @@ class ZipStream(object):
         """
         fields = {"comp_size" : compsize,
                   "uncomp_size" : fsize }
-        data = EXTRA_64_TUPLE( **fields )
-        data = EXTRA_64_STRUCT.pack( *data )
-        return self.make_extra_field(0x0001, data)
+        data = consts.EXTRA_64_TUPLE( **fields )
+        data = consts.EXTRA_64_STRUCT.pack( *data )
+        return self._make_extra_field(0x0001, data)
 
-    def make_local_file_header(self, idx):
+    
+    def _make_local_file_header(self, file_struct):
         """
         Create file header
         """
-        fileinfo = self.__files[idx]
-        fields = { "signature" : LF_MAGIC,
-                   "version" : self.__version,
-                   "flags" : fileinfo['flags'],
-                   "compression" : 0,
-                   "mod_time" : fileinfo['mod_time'],
-                   "mod_date" : fileinfo['mod_date'],
-                   "crc" : 0,
-                   "uncomp_size" : 0,
-                   "comp_size" : 0,
-                   "fname_len" : len(fileinfo['fname']),
-                   "extra_len":0,
-                   }
+        fields = {"signature": consts.LF_MAGIC,
+                  "version": self.__version,
+                  "flags": file_struct['flags'],
+                  "compression": file_struct['cmpr_id'],
+                  "mod_time": file_struct['mod_time'],
+                  "mod_date": file_struct['mod_date'],
+                  "crc": 0,
+                  "uncomp_size": 0,
+                  "comp_size": 0,
+                  "fname_len": len(file_struct['fname']),
+                  "extra_len": 0}
         if self.__zip64headers:
             # in zip64 file size headers are set to 0xffffffff
             fields['uncomp_size'] = 0xffffffff
@@ -192,55 +219,54 @@ class ZipStream(object):
             # additional extra field is added
             z64extra = self.make_zip64_local_extra(0,0)
             fields['extra_len'] = len(z64extra)
-        head = LF_TUPLE( **fields )
-        head = LF_STRUCT.pack( *head )
-        head += fileinfo['fname']
+        head = consts.LF_TUPLE(**fields)
+        head = consts.LF_STRUCT.pack(*head)
+        head += file_struct['fname']
         if self.__zip64headers:
             head += z64extra
-        self.__files[idx]['header'] = head
+        # self.__files[idx]['header'] = head
         return head
 
-    def make_data_descriptor(self, idx):
+    def _make_data_descriptor(self, file_struct, crc, org_size, compr_size):
         """
         Create file descriptor.
+        This function also updates size and crc fields of file_struct
         """
-        fileinfo = self.__files[idx]
-        fields = { "uncomp_size" : fileinfo['size'],
-                   "comp_size" : fileinfo['size'],
-                   "crc": fileinfo['crc'] }
-        descriptor = DD_TUPLE( **fields )
-        if self.__zip64headers:
-            descriptor = DD_STRUCT64.pack( *descriptor )
-        else:
-            descriptor = DD_STRUCT.pack( *descriptor )
+        # hack for making CRC unsigned long
+        file_struct['crc'] = crc & 0xffffffff
+        file_struct['size'] = org_size
+        file_struct['csize'] = compr_size
+        fields = {"uncomp_size": file_struct['size'],
+                  "comp_size": file_struct['csize'],
+                  "crc": file_struct['crc']}
+        descriptor = consts.DD_TUPLE(**fields)
+        descriptor = consts.DD_STRUCT.pack(*descriptor)
         if self.__use_ddmagic:
-            descriptor = DD_MAGIC + descriptor
+            descriptor = consts.DD_MAGIC + descriptor
         return descriptor
 
-    def make_cdir_file_header(self, idx):
+    def _make_cdir_file_header(self, file_struct):
         """
         Create central directory file header
         """
-        fileinfo = self.__files[idx]
-        fields = {"signature" : CDFH_MAGIC,
-                  "system" : 0x03, # 0x03 - unix
-                  "version" : self.__version,
-                  "version_ndd" : self.__version,
-                  "flags" : fileinfo['flags'],
-                  "compression" : 0, # no compression
-                  "mod_time" : fileinfo['mod_time'],
-                  "mod_date" : fileinfo['mod_date'],
-                  "uncomp_size" : fileinfo['size'],
-                  "comp_size" : fileinfo['size'],
-                  "offset" :  fileinfo['offset'], # < file header offset
-                  "crc" : fileinfo['crc'],
-                  "fname_len" : len(fileinfo['fname']),
-                  "extra_len" : 0,
-                  "fcomm_len" : 0, # comment length
-                  "disk_start" : 0,
-                  "attrs_int" :  0,
-                  "attrs_ext" : 0,
-        }
+        fields = {"signature": consts.CDFH_MAGIC,
+                  "system": 0x03,  # 0x03 - unix
+                  "version": self.__version,
+                  "version_ndd": self.__version,
+                  "flags": file_struct['flags'],
+                  "compression": file_struct['cmpr_id'],
+                  "mod_time": file_struct['mod_time'],
+                  "mod_date": file_struct['mod_date'],
+                  "uncomp_size": file_struct['size'],
+                  "comp_size": file_struct['csize'],
+                  "offset": file_struct['offset'],  # < file header offset
+                  "crc": file_struct['crc'],
+                  "fname_len": len(file_struct['fname']),
+                  "extra_len": 0,
+                  "fcomm_len": 0,  # comment length
+                  "disk_start": 0,
+                  "attrs_int": 0,
+                  "attrs_ext": 0}
         if self.__zip64headers:
             # in zip64 file size headers and offset are set to 0xffffffff
             fields['uncomp_size'] = 0xffffffff
@@ -248,43 +274,43 @@ class ZipStream(object):
             fields['offset'] = 0xffffffff
             # additional extra field is added
             z64extra = self.make_zip64_cdir_extra(
-                fileinfo['size'],
-                fileinfo['size'],
-                fileinfo['offset'])
+                file_struct['size'],
+                file_struct['size'],
+                file_struct['offset'])
             fields['extra_len'] = len(z64extra)
-        cdfh = CDLF_TUPLE( **fields )
-        cdfh = CDLF_STRUCT.pack( *cdfh )
-        cdfh += fileinfo['fname']
+        cdfh = consts.CDLF_TUPLE(**fields)
+        cdfh = consts.CDLF_STRUCT.pack(*cdfh)
+        cdfh += file_struct['fname']
         # extra headers
         if self.__zip64headers:
             cdfh += z64extra
         return cdfh
 
-    def make_cdend(self):
+    def _make_cdend(self):
         """
         make end of central directory record
         """
-        fields = {"signature" : CD_END_MAGIC,
-                  "disk_num" : 0,
-                  "disk_cdstart" : 0,
-                  "disk_entries" : len(self.__files),
-                  "total_entries" : len(self.__files),
-                  "cd_size" : self.__cdir_size,
-                  "cd_offset" : self.__offset,
-                  "comment_len" : 0,
-                 }
+        fields = {"signature": consts.CD_END_MAGIC,
+                  "disk_num": 0,
+                  "disk_cdstart": 0,
+                  "disk_entries": len(self.__files),
+                  "total_entries": len(self.__files),
+                  "cd_size": self.__cdir_size,
+                  "cd_offset": self._offset_get(),
+                  "comment_len": 0}
+        
         if self.__zip64headers:
             fields['cd_size'] = 0xffff
             fields['cd_offset'] = 0xffff
-        cdend = CD_END_TUPLE( **fields )
-        cdend = CD_END_STRUCT.pack( *cdend )
+        cdend = consts.CD_END_TUPLE(**fields)
+        cdend = consts.CD_END_STRUCT.pack(*cdend)
         return cdend
 
     def make_cdend64(self):
         """
         make zip64 end of central directory record
         """
-        fields = {"signature" : CD_END_MAGIC64,
+        fields = {"signature" : consts.CD_END_MAGIC64,
                   "zip64_eocd_size" : CD_END_STRUCT64.size - 12, # self size
                   "version" : self.__version,
                   "version_ndd" : self.__version,
@@ -295,8 +321,8 @@ class ZipStream(object):
                   "cd_size" : self.__cdir_size,
                   "cd_offset" : self.__offset,
                  }
-        cdend = CD_END_TUPLE64( **fields )
-        cdend = CD_END_STRUCT64.pack( *cdend )
+        cdend = consts.CD_END_TUPLE64( **fields )
+        cdend = consts.CD_END_STRUCT64.pack( *cdend )
         return cdend
 
     def make_eocd64_locator(self, offset):
@@ -308,65 +334,90 @@ class ZipStream(object):
                   "offset" : offset,
                   "disk_count" : 0,
                  }
-        cdend = CD_LOC64_TUPLE( **fields )
-        cdend = CD_LOC64_STRUCT.pack( *cdend )
+        cdend = consts.CD_LOC64_TUPLE( **fields )
+        cdend = consts.CD_LOC64_STRUCT.pack( *cdend )
         return cdend
 
-
-    # stream single zip file with header and descriptor
-    def stream_single_file(self, idx):
-        # file header
-        yield self.make_local_file_header(idx)
-        # file content
-        crc = None
-        with file( self.__files[idx]['src'], "rb" ) as fh:
-            while True:
-                part = fh.read( self.chunksize )
-                if not part: break
-                yield part
-                if crc:
-                    crc = zlib.crc32(part, crc)
-                else:
-                    crc = zlib.crc32(part)
-        if not crc:
-            crc = 0
-        self.__files[idx]['crc'] = crc & 0xffffffff # hack for making CRC unsigned long
-        # file descriptor
-        yield self.make_data_descriptor(idx)
-
-    # stream archive
-    def stream(self):
-        # stream files
-        idx = 0
-        while idx<len(self.__files):
-            # file offset in zip
-            self.__files[idx]['offset'] = self.__offset
-            # file data
-            for chunk in self.stream_single_file(idx):
-                self.__offset += len(chunk)
-                yield chunk
-            idx += 1
+    def _make_end_structures(self):
+        """
+        cdir and cdend structures are saved at the end of zip file
+        """
         # stream central directory entries
-        idx = 0
-        while idx<len(self.__files):
-            for chunk in self.make_cdir_file_header(idx):
-                self.__cdir_size += len(chunk)
-                yield(chunk)
-            idx += 1
+        for idx, file_struct in enumerate(self.__files):
+            chunk = self._make_cdir_file_header(file_struct)
+            self.__cdir_size += len(chunk)
+            yield chunk
+        # stream end of central directory
+        yield self._make_cdend()
+
+    def _offset_add(self, value):
+        self.__offset += value
+
+    def _offset_get(self):
+        return self.__offset
+
+    def _add_file_to_cdir(self, file_struct):
+        self.__files.append(file_struct)
+
+    def _cleanup(self):
+        """
+        Clean all structs after streaming
+        """
+        self.__files = []
+        self.__cdir_size = self.__offset = 0
+
+
+class ZipStream(ZipBase):
+
+    def data_generator(self, src, src_type):
+        if src_type == 's':
+            for chunk in src:
+                yield chunk
+            return
+        if src_type == 'f':
+            with open(src, "rb") as fh:
+                while True:
+                    part = fh.read(self.chunksize)
+                    if not part:
+                        break
+                    yield part
+            return
+
+    def _stream_single_file(self, file_struct):
+        """
+        stream single zip file with header and descriptor at the end
+        """
+        yield self._make_local_file_header(file_struct)
+        pcs = Processor(file_struct)
+        for chunk in self.data_generator(file_struct['src'], file_struct['stype']):
+            chunk = pcs.process(chunk)
+            if len(chunk) > 0:
+                yield chunk
+        chunk = pcs.tail()
+        if len(chunk) > 0:
+            yield chunk
+        yield self._make_data_descriptor(file_struct, *pcs.state())
+
+    def stream(self):
+        """
+        Stream complete archive
+        """
+        # stream files
+        for idx, source in enumerate(self._source_of_files):
+            file_struct = self._create_file_struct(source)
+            # file offset in archive
+            file_struct['offset'] = self._offset_get()
+            self._add_file_to_cdir(file_struct)
+            # file data
+            for chunk in self._stream_single_file(file_struct):
+                self._offset_add(len(chunk))
+                yield chunk
+        # stream zip structures
+        for chunk in self._make_end_structures():
+            yield chunk
         # stream zip64 records
         if self.__zip64headers:
             eocd64position = self.__offset + self.__cdir_size
             yield( self.make_cdend64() )
             yield( self.make_eocd64_locator(eocd64position) )
-        # stream end of central directory
-        yield( self.make_cdend() )
-
-
-if __name__ == '__main__':
-    zs = ZipStream(zip64=True, chunksize=48)
-    zs.add_file("temp_file_1.txt")
-    zs.add_file("temp_file_2.jpg")
-    #zs.add_file("temp_file_3.txt")
-    with file("zipout.zip","wb") as fo:
-        for f in zs.stream():
-            fo.write(f)
+        self._cleanup()

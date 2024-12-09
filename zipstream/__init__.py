@@ -1,4 +1,9 @@
-#coding: utf-8
-from __future__ import unicode_literals, absolute_import
 from .zipstream import ZipStream
-version = "0.1"
+import sys
+
+# AioZipStream is avilable from Python 3.6 version
+if (sys.version_info.major >= 3) and (sys.version_info.minor >= 6):
+    from .aiozipstream import AioZipStream
+del sys
+
+version = "0.4"
