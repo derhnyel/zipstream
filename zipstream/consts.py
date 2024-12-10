@@ -1,19 +1,22 @@
+"""Constants and data structures for ZIP file streaming."""
+
 import struct
 from typing import NamedTuple
 
-# zip constants
-ZIP32_VERSION: int = 20
-ZIP64_VERSION: int = 45
-ZIP32_LIMIT: int = (1 << 31) - 1
-UTF8_FLAG: int = 0x800   # utf-8 filename encoding flag
+# ZIP format versions
+ZIP32_VERSION: int = 20  # Version needed to extract ZIP32 archives
+ZIP64_VERSION: int = 45  # Version needed to extract ZIP64 archives
+ZIP32_LIMIT: int = (1 << 31) - 1  # Maximum size for ZIP32 archives
+UTF8_FLAG: int = 0x800  # UTF-8 filename encoding flag
 
-# zip compression methods
-COMPRESSION_STORE: int = 0
-COMPRESSION_DEFLATE: int = 8
+# ZIP compression methods
+COMPRESSION_STORE: int = 0  # No compression
+COMPRESSION_DEFLATE: int = 8  # Deflate compression
 
 # file header
 LF_STRUCT: struct.Struct = struct.Struct(b"<4sHHHHHLLLHH")
 class FileHeader(NamedTuple):
+    """Represents the local file header in a ZIP file."""
     signature: bytes
     version: int
     flags: int
@@ -31,18 +34,21 @@ LF_MAGIC: bytes = b'\x50\x4b\x03\x04'
 # extra fields
 EXTRA_STRUCT: struct.Struct = struct.Struct(b"<HH")
 class Extra(NamedTuple):
+    """Represents an extra field in a ZIP file."""
     signature: int
     size: int
 EXTRA_TUPLE = Extra
 
 EXTRA_64_STRUCT: struct.Struct = struct.Struct(b"<QQ")
 class Extra64Local(NamedTuple):
+    """Represents a ZIP64 extra field in the local file header."""
     uncomp_size: int
     comp_size: int
 EXTRA_64_TUPLE = Extra64Local
 
 CD_EXTRA_64_STRUCT: struct.Struct = struct.Struct(b"<QQQ")
 class Extra64Cdir(NamedTuple):
+    """Represents a ZIP64 extra field in the central directory."""
     uncomp_size: int
     comp_size: int
     offset: int
@@ -52,6 +58,7 @@ CD_EXTRA_64_TUPLE = Extra64Cdir
 DD_STRUCT: struct.Struct = struct.Struct(b"<LLL")
 DD_STRUCT64: struct.Struct = struct.Struct(b"<LQQ")
 class FileCrc(NamedTuple):
+    """Represents the data descriptor in a ZIP file."""
     crc: int
     comp_size: int
     uncomp_size: int
@@ -62,6 +69,7 @@ DD_MAGIC: bytes = b'\x50\x4b\x07\x08'
 # Note: version and system fields represent "version made by"
 CDLF_STRUCT: struct.Struct = struct.Struct(b"<4sBBHHHHHLLLHHHHHLL")
 class CdFileHeader(NamedTuple):
+    """Represents the central directory file header in a ZIP file."""
     signature: bytes
     version: int    # low-order byte of 'version made by'
     system: int     # high-order byte (host OS)
@@ -86,6 +94,7 @@ CDFH_MAGIC: bytes = b'\x50\x4b\x01\x02'
 # end of central directory record
 CD_END_STRUCT: struct.Struct = struct.Struct(b"<4sHHHHLLH")
 class CdEnd(NamedTuple):
+    """Represents the end of central directory record in a ZIP file."""
     signature: bytes
     disk_num: int
     disk_cdstart: int
@@ -100,6 +109,7 @@ CD_END_MAGIC: bytes = b'\x50\x4b\x05\x06'
 # zip64 end of central directory record
 CD_END_STRUCT64: struct.Struct = struct.Struct(b"<4sQHHIIQQQQ")
 class CdEnd64(NamedTuple):
+    """Represents the ZIP64 end of central directory record in a ZIP file."""
     signature: bytes
     zip64_eocd_size: int
     version: int
@@ -116,6 +126,7 @@ CD_END_MAGIC64: bytes = b'\x50\x4b\x06\x06'
 # zip64 end of central directory locator
 CD_LOC64_STRUCT: struct.Struct = struct.Struct(b"<4sLQL")
 class CdFileHeader64(NamedTuple):
+    """Represents the ZIP64 end of central directory locator in a ZIP file."""
     signature: bytes
     disk_cdstart: int
     offset: int

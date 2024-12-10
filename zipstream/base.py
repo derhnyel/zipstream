@@ -5,21 +5,59 @@ from typing import List, Dict, Generator, Union
 
 from . import consts
 
+# Define custom exceptions
+class ZipStreamError(Exception):
+    """Base class for exceptions in zipstream."""
+
+class MissingSourceError(ZipStreamError):
+    """Raised when no 'file' or 'stream' key is found in the data source."""
+
+class UnsupportedCompressionError(ZipStreamError):
+    """Raised when an unsupported compression method is specified."""
+
+class UnsupportedSourceTypeError(ZipStreamError):
+    """Raised when an unknown source type is provided."""
+
+class Zip64RequiredError(ZipStreamError):
+    """Raised when ZIP64 mode is required but explicitly disabled."""
+
+# Define the Processor class
 class Processor:
     """
-    Process file data and compress it if needed
+    Processes file data and applies compression if specified.
+
+    Args:
+        file_struct: File structure containing metadata and compression method.
+
+    Raises:
+        UnsupportedCompressionError: If an unsupported compression method is specified.
     """
 
     def __init__(self, file_struct: Dict[str, Union[str, int, None]]) -> None:
         self.crc = 0
         self.o_size = self.c_size = 0
-        if file_struct['cmethod'] is None:
-            self.process = self._process_through
-            self.tail = self._no_tail
-        elif file_struct['cmethod'] == 'deflate':
+        self.process, self.tail = self._get_compression_methods(file_struct['cmethod'])
+
+    def _get_compression_methods(self, cmethod: Union[str, None]):
+        """
+        Determines the processing methods based on the compression method.
+
+        Args:
+            cmethod: Compression method ('deflate' or None).
+
+        Returns:
+            A tuple containing the process method and the tail method.
+
+        Raises:
+            UnsupportedCompressionError: If the compression method is unsupported.
+        """
+        if cmethod is None:
+            return self._process_through, self._no_tail
+        elif cmethod == 'deflate':
             self.compr = zlib.compressobj(5, zlib.DEFLATED, -15)
-            self.process = self._process_deflate
-            self.tail = self._tail_deflate
+            return self._process_deflate, self._tail_deflate
+        else:
+            raise UnsupportedCompressionError(f"Unsupported compression method '{cmethod}'.")
 
     # no compression
     def _process_through(self, chunk: bytes) -> bytes:
@@ -53,37 +91,59 @@ class Processor:
 
 class ZipBase:
     """
-    Base class for ZIP file streaming
+    Base class for ZIP file streaming.
+
+    Args:
+        files: List of files or streams to include in the archive.
+        chunksize: Size of chunks to read from files (default 1024 bytes).
+        zip64: Use ZIP64 format for large files (default False).
+
+    Raises:
+        Zip64RequiredError: If ZIP64 mode is required but explicitly disabled
     """
 
-    def __init__(self, files: List[Dict[str, Union[str, None]]] = [], chunksize: int = 1024, zip64: bool = False) -> None:
-        self._source_of_files = files
+    def __init__(self, files: List[Dict[str, Union[str, None]]] = None, chunksize: int = 1024, zip64: bool = False) -> None:
+        self._source_of_files = files or []
         self.__files = []
         self.__zip64headers = False
         self.__version = consts.ZIP32_VERSION
+        self.zip64 = zip64
         if zip64:
-            self.zip64 = None
             self.zip64_required()
-        else:
-            self.zip64 = zip64
         self.chunksize = chunksize
         self.__use_ddmagic = True
         self.__cdir_size = self.__offset = 0
 
     def zip64_required(self) -> None:
         """
-        Turn on zip64 mode for archive
+        Enables ZIP64 mode for the archive.
+
+        Raises:
+            Zip64RequiredError: If ZIP64 mode is required for the archive.
         """
         if self.zip64:
             return
         if self.zip64 is False:
             # zip64 was explicitly disabled before
-            raise Exception("Zip64 mode is required to stream large files")
+            raise  Zip64RequiredError("ZIP64 mode is required for this archive.")
         self.zip64 = True
         self.__zip64headers = True
         self.__version = consts.ZIP64_VERSION
 
     def _create_file_struct(self, data: Dict[str, Union[str, None]]) -> Dict[str, Union[str, int, bytes]]:
+        """
+        Creates a file structure with metadata and data source.
+
+        Args:
+            data: File data dictionary with 'file' or 'stream' key and optional 'name' key.
+
+        Returns:
+            A dictionary representing the file structure.
+
+        Raises:
+            MissingSourceError: If neither 'file' nor 'stream' are provided.
+            UnsupportedCompressionError: If an unsupported compression method is specified.
+        """
         dt = time.localtime()
         dosdate = ((dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]) & 0xffff
         dostime = (dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)) & 0xffff
@@ -106,11 +166,12 @@ class ZipBase:
             file_struct['src'] = data['stream']
             file_struct['stype'] = 's'
         else:
-            raise Exception('No file or stream in sources')
+            raise MissingSourceError("No 'file' or 'stream' key found in data source.")
 
         cmpr = data.get('compression', None)
         if cmpr not in (None, 'deflate'):
-            raise Exception('Unknown compression method %r' % cmpr)
+            raise UnsupportedCompressionError(f"Unsupported compression method '{cmpr}'.")
+
         file_struct['cmethod'] = cmpr
         file_struct['cmpr_id'] = {
             None: consts.COMPRESSION_STORE,
@@ -128,13 +189,33 @@ class ZipBase:
         return file_struct
 
     def _make_extra_field(self, signature: int, data: bytes) -> bytes:
-        fields = {"signature": signature,
-                  "size": len(data)}
+        """
+        Create extra field with signature and data
+
+        Args:
+            signature: Extra field signature.
+            data: Extra field data.
+
+        Returns:
+            Extra field with signature and data. (bytes)
+        """
+        fields = {"signature": signature, "size": len(data)}
         head = consts.EXTRA_TUPLE(**fields)
         head = consts.EXTRA_STRUCT.pack(*head)
         return head + data
 
-    def make_zip64_cdir_extra(self, fsize: int, compsize: int, offset: int) -> bytes:
+    def _make_zip64_cdir_extra(self, fsize: int, compsize: int, offset: int) -> bytes:
+        """
+        Create ZIP64 extra field for central directory
+
+        Args:
+            fsize: Uncompressed file size.
+            compsize: Compressed file size.
+            offset: File offset in the archive.
+
+        Returns:
+            ZIP64 extra field for central directory. (bytes)
+        """
         fields = {
             "uncomp_size": fsize,
             "comp_size": compsize,
@@ -144,7 +225,7 @@ class ZipBase:
         data = consts.CD_EXTRA_64_STRUCT.pack(*data)
         return self._make_extra_field(0x0001, data)
 
-    def make_zip64_local_extra(self, fsize: int, compsize: int) -> bytes:
+    def _make_zip64_local_extra(self, fsize: int, compsize: int) -> bytes:
         fields = {
             "uncomp_size": fsize,
             "comp_size": compsize
@@ -154,6 +235,21 @@ class ZipBase:
         return self._make_extra_field(0x0001, data)
 
     def _make_local_file_header(self, file_struct: Dict[str, Union[str, int, bytes]]) -> bytes:
+        """
+        Create local file header
+        According to the ZIP spec and the structures:
+        version (low byte) and system (high byte) form "version made by".
+
+        Args:
+            file_struct: File structure dictionary with metadata.
+
+        Returns:
+            Local file header. (bytes)
+
+        Raises:
+            Zip64RequiredError: If ZIP64 mode is required but explicitly disabled.
+        """
+
         fields = {
             "signature": consts.LF_MAGIC,
             "version": self.__version,
@@ -170,7 +266,7 @@ class ZipBase:
         if self.__zip64headers:
             fields['uncomp_size'] = 0xffffffff
             fields['comp_size'] = 0xffffffff
-            z64extra = self.make_zip64_local_extra(0, 0)
+            z64extra = self._make_zip64_local_extra(0, 0)
             fields['extra_len'] = len(z64extra)
         head = consts.LF_TUPLE(**fields)
         head = consts.LF_STRUCT.pack(*head)
@@ -180,6 +276,18 @@ class ZipBase:
         return head
 
     def _make_data_descriptor(self, file_struct: Dict[str, Union[str, int, bytes]], crc: int, org_size: int, compr_size: int) -> bytes:
+        """
+        Create data descriptor
+        
+        Args:
+            file_struct: File structure dictionary with metadata.
+            crc: CRC32 checksum of the file.
+            org_size: Original file size.
+            compr_size: Compressed file size.
+        
+        Returns:
+            Data descriptor. (bytes)
+        """
         file_struct['crc'] = crc & 0xffffffff
         file_struct['size'] = org_size
         file_struct['csize'] = compr_size
@@ -205,6 +313,12 @@ class ZipBase:
         Create central directory file header
         According to the ZIP spec and the structures:
         version (low byte) and system (high byte) form "version made by".
+
+        Args:
+            file_struct: File structure dictionary with metadata.
+
+        Returns:
+            Central directory file header. (bytes)
         """
         fields = {
             "signature": consts.CDFH_MAGIC,
@@ -266,7 +380,7 @@ class ZipBase:
         cdend = consts.CD_END_STRUCT.pack(*cdend)
         return cdend
 
-    def make_cdend64(self) -> bytes:
+    def _make_cdend64(self) -> bytes:
         """
         make zip64 end of central directory record
         """
@@ -286,7 +400,7 @@ class ZipBase:
         cdend = consts.CD_END_STRUCT64.pack(*cdend)
         return cdend
 
-    def make_eocd64_locator(self, offset: int) -> bytes:
+    def _make_eocd64_locator(self, offset: int) -> bytes:
         fields = {
             "signature": consts.CD_LOC64_MAGIC,
             "disk_cdstart": 0,
@@ -308,9 +422,9 @@ class ZipBase:
             # Calculate EOCD64 position
             eocd64position = self.__offset + self.__cdir_size
             # Write ZIP64 EOCD
-            yield self.make_cdend64()
+            yield self._make_cdend64()
             # Write ZIP64 EOCD locator
-            yield self.make_eocd64_locator(eocd64position)
+            yield self._make_eocd64_locator(eocd64position)
         # Write EOCD
         yield self._make_cdend()
 
@@ -328,6 +442,10 @@ class ZipBase:
         self.__cdir_size = self.__offset = 0
 
     def total_size(self) -> int:
+        """
+        Returns:
+            Total size of all files in the archive.
+        """
         total_size = 0
         for file in self._source_of_files:
             if 'file' in file:

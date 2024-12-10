@@ -2,11 +2,9 @@
 # ZIP File streaming
 # based on official ZIP File Format Specification version 6.3.4
 # https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
-#
-import asyncio
+
 from typing import Any, AsyncGenerator, Dict, Union
-from .base import ZipBase, Processor
-from concurrent import futures
+from .base import ZipBase, Processor, MissingSourceError, UnsupportedSourceTypeError
 try:
     import aiofiles
     aio_available = True
@@ -19,30 +17,51 @@ __all__ = ("AioZipStream",)
 
 class AioZipStream(ZipBase):
     """
-    Asynchronous version of ZipStream
+    Asynchronous version of ZipStream.
+
+    Args:
+        files: List of files to be added to the archive.
+        chunksize: Size of chunks to read from files (default 1024 bytes).
+        zip64: Use ZIP64 format for large files (default False).
+
+    Raises:
+        MissingSourceError: If 'aiofiles' is required but not installed.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(AioZipStream, self).__init__(*args, **kwargs)
-        self.__tpex: futures.ThreadPoolExecutor
-
-    def __get_executor(self) -> futures.ThreadPoolExecutor:
-        try:
-            return self.__tpex
-        except AttributeError:
-            self.__tpex = futures.ThreadPoolExecutor(max_workers=1)
-            return self.__tpex
-
-    async def _execute_aio_task(self, task: Any, *args: Any, **kwargs: Any) -> Any:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.__get_executor(), task, *args, **kwargs)
 
     def _create_file_struct(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Creates a file structure with metadata and data source.
+
+        Args:
+            data: File data dictionary with 'file' or 'src' key and optional 'name' key.
+
+        Returns:
+            A dictionary representing the file structure.
+
+        Raises:
+            MissingSourceError: If 'aiofiles' is required but not installed.
+        """
         if 'file' in data and not aio_available:
-            raise Exception("aiofiles module is required to stream files asynchronously")
+            raise MissingSourceError("The 'aiofiles' module is required to stream files asynchronously.")
         return super(AioZipStream, self)._create_file_struct(data)
 
     async def data_generator(self, src: Union[str, AsyncGenerator[bytes, None]], src_type: str) -> AsyncGenerator[bytes, None]:
+        """
+        Asynchronous generator for file data.
+
+        Args:
+            src: Source of data.
+            src_type: Type of source ('s' for generator, 'f' for file).
+
+        Yields:
+            Chunks of file data (bytes).
+
+        Raises:
+            UnsupportedSourceTypeError: If an unknown source type is provided.
+        """
         if src_type == 's':
             async for chunk in src:
                 yield chunk
@@ -54,22 +73,35 @@ class AioZipStream(ZipBase):
                         break
                     yield part
         else:
-            raise ValueError(f"Unknown source type: {src_type}")
+            raise UnsupportedSourceTypeError(f"Unknown source type: {src_type}")
 
     async def _stream_single_file(self, file_struct: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
         """
-        Stream single zip file with header and descriptor at the end.
+        Asynchronously streams a single file with headers and data descriptors.
+
+        Args:
+            file_struct: File structure dictionary with file data and metadata.
+
+        Yields:
+            Chunks of file data (bytes).
         """
         yield self._make_local_file_header(file_struct)
         pcs = Processor(file_struct)
         async for chunk in self.data_generator(file_struct['src'], file_struct['stype']):
-            yield await self._execute_aio_task(pcs.process, chunk)
-        chunk = await self._execute_aio_task(pcs.tail)
-        if chunk:
-            yield chunk
+            processed_chunk = pcs.process(chunk)
+            yield processed_chunk
+        tail_chunk = pcs.tail()
+        if tail_chunk:
+            yield tail_chunk
         yield self._make_data_descriptor(file_struct, *pcs.state())
 
     async def stream(self) -> AsyncGenerator[bytes, None]:
+        """
+        Streams the complete archive asynchronously.
+
+        Yields:
+            Chunks of the archive (bytes).
+        """
         for source in self._source_of_files:
             file_struct = self._create_file_struct(source)
             file_struct['offset'] = self._offset_get()
